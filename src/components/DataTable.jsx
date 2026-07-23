@@ -1,0 +1,299 @@
+import { useState, useEffect } from 'react';
+import djangoClient from '../api/djangoClient';
+import { copyToClipboard, exportCSV, exportExcel, exportPDF, printTable } from '../utils/tableExport';
+
+// Skeleton row — shown while loading (U-16)
+function SkeletonRows({ cols, rows = 5 }) {
+  return Array.from({ length: rows }).map((_, i) => (
+    <tr key={i} className="dt-skeleton-row">
+      {Array.from({ length: cols }).map((_, j) => (
+        <td key={j}>
+          <div
+            className="dt-skeleton-cell"
+            style={{ width: j === cols - 1 ? 80 : `${60 + ((i + j) % 3) * 15}%` }}
+          />
+        </td>
+      ))}
+    </tr>
+  ));
+}
+
+// Empty state — icon + message (U-15)
+function EmptyState({ cols, isFiltered }) {
+  return (
+    <tr>
+      <td colSpan={cols} className="text-center py-5">
+        <div className="dt-empty-state">
+          <i className={isFiltered ? 'ri-search-line' : 'ri-inbox-2-line'}></i>
+          <p className="dt-empty-title">
+            {isFiltered ? 'No results found' : 'No records yet'}
+          </p>
+          <p className="dt-empty-sub">
+            {isFiltered
+              ? 'Try adjusting your search or filter.'
+              : 'Records will appear here once added.'}
+          </p>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+export default function DataTable({
+  columns,
+  ajaxUrl,
+  mode = 'django',
+  extraParams = {},
+  onEdit,
+  onDelete,
+  onView,
+  showActiveFilter = true,
+  showExportButtons = false,
+  exportTitle = 'Report',
+  exportFilename = 'export',
+}) {
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [totalRecords, setTotalRecords] = useState(0);
+  const [length, setLength] = useState(10);
+  const [start, setStart] = useState(0);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [activeStatus, setActiveStatus] = useState('1');
+  const [draw, setDraw] = useState(1);
+
+  const fetchData = async () => {
+    setLoading(true);
+    try {
+      // ponytail: mode='php' path removed — every <DataTable> caller passes mode="django" now.
+      const params = { page: Math.floor(start / length) + 1, page_size: length === -1 ? 100 : length };
+      if (searchQuery) params.search = searchQuery;
+      Object.assign(params, extraParams);
+
+      const response = await djangoClient.get(ajaxUrl, { params });
+      setData(response.data.data.results || []);
+      setTotalRecords(response.data.data.count || 0);
+    } catch (err) {
+      console.error('DataTable fetch error:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchAllData = async () => {
+    const params = { page: 1, page_size: 10000 };
+    if (searchQuery) params.search = searchQuery;
+    Object.assign(params, extraParams);
+    const response = await djangoClient.get(ajaxUrl, { params });
+    return response.data.data.results || [];
+  };
+
+  const handleExport = async (type) => {
+    try {
+      const allRows = await fetchAllData();
+      switch (type) {
+        case 'copy':    copyToClipboard(allRows, columns); break;
+        case 'csv':     exportCSV(allRows, columns, exportFilename); break;
+        case 'excel':   exportExcel(allRows, columns, exportFilename); break;
+        case 'pdf':     exportPDF(allRows, columns, exportFilename, exportTitle); break;
+        case 'print':   printTable(allRows, columns, exportTitle); break;
+      }
+    } catch (err) {
+      console.error('Export error:', err);
+    }
+  };
+
+  useEffect(() => { fetchData(); }, [length, start, searchQuery, activeStatus, draw]);
+
+  const handleSearchChange = (e) => { setSearchQuery(e.target.value); setStart(0); setDraw(d => d + 1); };
+  const handleLengthChange  = (e) => { setLength(Number(e.target.value)); setStart(0); setDraw(d => d + 1); };
+  const handleStatusChange  = (e) => { setActiveStatus(e.target.value); setStart(0); setDraw(d => d + 1); };
+
+  const renderActionButtons = (uniqueId) => (
+    <div className="hstack gap-1 justify-content-end">
+      {onView && (
+        <button onClick={() => onView(uniqueId)} className="dt-action-btn dt-action-view" title="View" aria-label="View">
+          <i className="ri-eye-line"></i>
+        </button>
+      )}
+      {onEdit && (
+        <button onClick={() => onEdit(uniqueId)} className="dt-action-btn dt-action-edit" title="Edit" aria-label="Edit">
+          <i className="ri-edit-2-line"></i>
+        </button>
+      )}
+      {onDelete && (
+        <button onClick={() => onDelete(uniqueId)} className="dt-action-btn dt-action-delete" title="Delete" aria-label="Delete">
+          <i className="ri-delete-bin-line"></i>
+        </button>
+      )}
+    </div>
+  );
+
+  // Django-mode columns describe a value instead of a positional cell:
+  // { key: 'unit.unit_name' } for a dot-path lookup, { sno: true } for a
+  // client-computed row number, { actions: true } for the edit/delete buttons,
+  // and an optional render(value, row) on any of them for custom display.
+  const getByPath = (row, path) => path.split('.').reduce((acc, k) => acc?.[k], row);
+
+  const renderDjangoCell = (col, row, rIdx) => {
+    if (col.sno) return start + rIdx + 1;
+    if (col.actions) return renderActionButtons(row.unique_id);
+    const value = col.key ? getByPath(row, col.key) : undefined;
+    return col.render ? col.render(value, row) : value;
+  };
+
+  const currentPage = Math.floor(start / length) + 1;
+  const totalPages  = Math.ceil(totalRecords / length) || 1;
+
+  const handlePageChange = (page) => {
+    if (page < 1 || page > totalPages) return;
+    setStart((page - 1) * length);
+    setDraw(d => d + 1);
+  };
+
+  const getPageNumbers = () => {
+    const maxVisible = window.innerWidth < 768 ? 3 : 7;
+    if (totalPages <= maxVisible) return Array.from({ length: totalPages }, (_, i) => i + 1);
+    const pages = [1];
+    if (currentPage > 3) pages.push('…');
+    const lo = Math.max(2, currentPage - 1);
+    const hi = Math.min(totalPages - 1, currentPage + 1);
+    for (let i = lo; i <= hi; i++) pages.push(i);
+    if (currentPage < totalPages - 2) pages.push('…');
+    pages.push(totalPages);
+    return pages;
+  };
+
+  return (
+    <div className="card dt-card">
+
+      {/* ── Toolbar ── */}
+      <div className="card-header border-0 dt-toolbar">
+        <div className="d-flex align-items-center gap-2">
+          <span className="dt-label">Show</span>
+          <select
+            className="form-select form-select-sm dt-length-select"
+            value={length}
+            onChange={handleLengthChange}
+            aria-label="Rows per page"
+          >
+            {[10, 25, 50, 100].map(n => <option key={n} value={n}>{n}</option>)}
+            <option value="-1">All</option>
+          </select>
+          <span className="dt-label">entries</span>
+        </div>
+
+        <div className="hstack gap-2 flex-wrap">
+          {showActiveFilter && (
+            <select
+              className="form-select form-select-sm dt-status-select"
+              value={activeStatus}
+              onChange={handleStatusChange}
+              aria-label="Filter by status"
+            >
+              <option value="1">Active</option>
+              <option value="0">Inactive</option>
+              <option value="all">All</option>
+            </select>
+          )}
+
+          {/* Table-level search */}
+          <div className="dt-search-wrap position-relative">
+            <i className="ri-search-line dt-search-icon"></i>
+            <input
+              type="search"
+              className="form-control form-control-sm dt-search-input"
+              placeholder="Search table…"
+              value={searchQuery}
+              onChange={handleSearchChange}
+              aria-label="Search table"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* ── Export buttons ── */}
+      {showExportButtons && (
+        <div className="dt-export-bar px-3 py-2">
+          <button className="dt-export-btn" onClick={() => handleExport('copy')}>Copy</button>
+          <button className="dt-export-btn" onClick={() => handleExport('csv')}>CSV</button>
+          <button className="dt-export-btn" onClick={() => handleExport('excel')}>Excel</button>
+          <button className="dt-export-btn" onClick={() => handleExport('pdf')}>PDF</button>
+          <button className="dt-export-btn" onClick={() => handleExport('print')}>Print</button>
+        </div>
+      )}
+
+      {/* ── Table ── */}
+      <div className="card-body pt-0 px-0">
+        <div className="table-responsive">
+          <table className="table dt-table align-middle mb-0">
+
+            {/* Sticky header (U-12) */}
+            <thead className="dt-thead">
+              <tr>
+                {columns.map((col, idx) => (
+                  <th key={idx} className={`dt-th ${col.className || ''}`}>
+                    {col.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+
+            <tbody>
+              {loading
+                ? <SkeletonRows cols={columns.length} rows={length > 10 ? 8 : 5} />
+                : data.length === 0
+                  ? <EmptyState cols={columns.length} isFiltered={!!searchQuery} />
+                  : data.map((row, rIdx) => (
+                      <tr key={rIdx} className="dt-row" style={{ '--index': rIdx }}>
+                        {columns.map((col, cIdx) => (
+                          <td key={cIdx} className={`dt-td ${col.className || ''}`}>
+                            {renderDjangoCell(col, row, rIdx)}
+                          </td>
+                        ))}
+                      </tr>
+                    ))
+              }
+            </tbody>
+          </table>
+        </div>
+
+        {/* ── Pagination (U-17) ── */}
+        {length !== -1 && totalRecords > 0 && (
+          <div className="dt-pagination-bar">
+            <span className="dt-count">
+              Showing <strong>{start + 1}</strong>–<strong>{Math.min(start + length, totalRecords)}</strong> of <strong>{totalRecords}</strong>
+            </span>
+
+            <nav aria-label="Table pagination">
+              <ul className="dt-pagination">
+                <li className={currentPage === 1 ? 'dt-page-item disabled' : 'dt-page-item'}>
+                  <button className="dt-page-btn" onClick={() => handlePageChange(currentPage - 1)} aria-label="Previous page">
+                    <i className="ri-arrow-left-s-line"></i>
+                  </button>
+                </li>
+
+                {getPageNumbers().map((page, idx) => (
+                  <li key={idx} className={`dt-page-item ${page === currentPage ? 'active' : ''} ${page === '…' ? 'disabled' : ''}`}>
+                    <button
+                      className="dt-page-btn"
+                      onClick={() => page !== '…' && handlePageChange(page)}
+                      aria-current={page === currentPage ? 'page' : undefined}
+                    >
+                      {page}
+                    </button>
+                  </li>
+                ))}
+
+                <li className={currentPage === totalPages ? 'dt-page-item disabled' : 'dt-page-item'}>
+                  <button className="dt-page-btn" onClick={() => handlePageChange(currentPage + 1)} aria-label="Next page">
+                    <i className="ri-arrow-right-s-line"></i>
+                  </button>
+                </li>
+              </ul>
+            </nav>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
